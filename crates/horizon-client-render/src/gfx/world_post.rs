@@ -57,8 +57,8 @@ pub struct Post {
     sampler: wgpu::Sampler,
     copy: wgpu::RenderPipeline,
     fxaa: wgpu::RenderPipeline,
-    /// The world drawn below the screen's size, sharper than the bilinear copy.
-    /// `HORIZON_WORLD_UPSCALE=off` keeps the copy.
+    /// The world drawn below the screen's size, sharper than the bilinear copy: FSR 1.0's EASU
+    /// (`HORIZON_FSR=off`: Catmull-Rom). `HORIZON_WORLD_UPSCALE=off` keeps the copy.
     sharp: Option<wgpu::RenderPipeline>,
     /// Whether the vanilla world goes up with `sharp` (`upscales_sharply`). A shader pack's always does.
     sharp_world: bool,
@@ -247,8 +247,26 @@ impl Post {
         Self {
             copy: pipeline("fs_copy", &pipeline_layout, format),
             fxaa: pipeline("fs_fxaa", &pipeline_layout, format),
-            sharp: (std::env::var("HORIZON_WORLD_UPSCALE").as_deref() != Ok("off"))
-                .then(|| pipeline("fs_upscale", &pipeline_layout, format)),
+            sharp: (std::env::var("HORIZON_WORLD_UPSCALE").as_deref() != Ok("off")).then(|| {
+                // FSR 1.0's EASU (`fs_easu`), unless `HORIZON_FSR=off` or the device cannot
+                // compile it: then the Catmull-Rom `fs_upscale`.
+                let easu = (std::env::var("HORIZON_FSR").as_deref() != Ok("off"))
+                    .then(|| {
+                        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+                        let easu = pipeline("fs_easu", &pipeline_layout, format);
+                        let internal = pollster::block_on(internal.pop());
+                        match internal.or(pollster::block_on(validation.pop())) {
+                            None => Some(easu),
+                            Some(e) => {
+                                log::warn!("Horizon renderer: FSR 1.0 upscaling unavailable ({e})");
+                                None
+                            }
+                        }
+                    })
+                    .flatten();
+                easu.unwrap_or_else(|| pipeline("fs_upscale", &pipeline_layout, format))
+            }),
             sharp_world,
             layout,
             sampler,

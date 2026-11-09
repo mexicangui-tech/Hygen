@@ -54,6 +54,134 @@ struct PostOut {
     return vec4(clamp(sum / (wc + wu + wl + wr + wd), low, high), middle.a);
 }
 
+// FSR 1.0 EASU (AMD FidelityFX Super Resolution 1, MIT licence), ported to WGSL in f32. It reads
+// the world's 12-texel neighbourhood with `textureLoad` (no gathers, so the GL backend takes it
+// too), finds the local edge direction from luma and stretches a Lanczos-like kernel along it.
+// `EASU_SHARPEN` stands in for RCAS: an unsharp step against the plain bilinear value, kept
+// inside the 4 nearest texels' range so it cannot ring. 0.0 turns it off.
+const EASU_SHARPEN: f32 = 0.3;
+
+fn easu_load(p: vec2<i32>, last: vec2<i32>) -> vec4<f32> {
+    return textureLoad(world, clamp(p, vec2(0), last), 0);
+}
+
+fn easu_luma(c: vec3<f32>) -> f32 {
+    // Luma times two, in the cheapest form FSR uses.
+    return c.b * 0.5 + (c.r * 0.5 + c.g);
+}
+
+// One bilinear quad's share of the edge direction (xy) and of how edge-like it is (z).
+fn easu_set(w: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> vec3<f32> {
+    let len_x = 1.0 / max(max(abs(d - c), abs(c - b)), 1.0e-6);
+    let dir_x = d - b;
+    let sx = clamp(abs(dir_x) * len_x, 0.0, 1.0);
+    let len_y = 1.0 / max(max(abs(e - c), abs(c - a)), 1.0e-6);
+    let dir_y = e - a;
+    let sy = clamp(abs(dir_y) * len_y, 0.0, 1.0);
+    return vec3(dir_x * w, dir_y * w, (sx * sx + sy * sy) * w);
+}
+
+// One texel's weight (w) added to the running colour sum (rgb).
+fn easu_tap(off: vec2<f32>, dir: vec2<f32>, len: vec2<f32>, lob: f32, clp: f32, c: vec3<f32>) -> vec4<f32> {
+    let v = vec2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len;
+    let d2 = min(dot(v, v), clp);
+    // Lanczos2 without sin() or sqrt().
+    var wb = 0.4 * d2 - 1.0;
+    var wa = lob * d2 - 1.0;
+    wb = wb * wb;
+    wa = wa * wa;
+    wb = 1.5625 * wb - 0.5625;
+    let w = wb * wa;
+    return vec4(c * w, w);
+}
+
+@fragment fn fs_easu(in: PostOut) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(world));
+    let last = dims - 1;
+    var pp = in.uv * vec2<f32>(dims) - 0.5;
+    let fp = floor(pp);
+    pp = pp - fp;
+    let o = vec2<i32>(fp);
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    let b = easu_load(o + vec2(0, -1), last);
+    let c = easu_load(o + vec2(1, -1), last);
+    let e = easu_load(o + vec2(-1, 0), last);
+    let f = easu_load(o, last);
+    let g = easu_load(o + vec2(1, 0), last);
+    let h = easu_load(o + vec2(2, 0), last);
+    let i = easu_load(o + vec2(-1, 1), last);
+    let j = easu_load(o + vec2(0, 1), last);
+    let k = easu_load(o + vec2(1, 1), last);
+    let l = easu_load(o + vec2(2, 1), last);
+    let n = easu_load(o + vec2(0, 2), last);
+    let q = easu_load(o + vec2(1, 2), last);
+
+    let bl = easu_luma(b.rgb);
+    let cl = easu_luma(c.rgb);
+    let el = easu_luma(e.rgb);
+    let fl = easu_luma(f.rgb);
+    let gl = easu_luma(g.rgb);
+    let hl = easu_luma(h.rgb);
+    let il = easu_luma(i.rgb);
+    let jl = easu_luma(j.rgb);
+    let kl = easu_luma(k.rgb);
+    let ll = easu_luma(l.rgb);
+    let nl = easu_luma(n.rgb);
+    let ql = easu_luma(q.rgb);
+
+    let s = easu_set((1.0 - pp.x) * (1.0 - pp.y), bl, el, fl, gl, jl)
+        + easu_set(pp.x * (1.0 - pp.y), cl, fl, gl, hl, kl)
+        + easu_set((1.0 - pp.x) * pp.y, fl, il, jl, kl, nl)
+        + easu_set(pp.x * pp.y, gl, jl, kl, ll, ql);
+    var dir = s.xy;
+    var len = s.z;
+    var dir_r = dir.x * dir.x + dir.y * dir.y;
+    if dir_r < 1.0 / 32768.0 {
+        dir_r = 1.0;
+        dir.x = 1.0;
+    } else {
+        dir_r = inverseSqrt(dir_r);
+    }
+    dir = dir * dir_r;
+    // From {0 to 2} to {0 to 1}, shaped with a square.
+    len = len * 0.5;
+    len = len * len;
+    // Stretch the kernel from 1 (straight edges) to sqrt(2) (diagonals).
+    let stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));
+    let len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    // The window shifts from +/-sqrt(2) to just beyond 2 with the amount of edge.
+    let lob = 0.5 + ((0.25 - 0.04) - 0.5) * len;
+    let clp = 1.0 / lob;
+
+    // Deringing: the output stays inside the 4 nearest texels' range.
+    let min4 = min(min(j.rgb, k.rgb), min(f.rgb, g.rgb));
+    let max4 = max(max(j.rgb, k.rgb), max(f.rgb, g.rgb));
+
+    var acc = vec4(0.0);
+    acc += easu_tap(vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b.rgb);
+    acc += easu_tap(vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c.rgb);
+    acc += easu_tap(vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i.rgb);
+    acc += easu_tap(vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j.rgb);
+    acc += easu_tap(vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f.rgb);
+    acc += easu_tap(vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e.rgb);
+    acc += easu_tap(vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k.rgb);
+    acc += easu_tap(vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l.rgb);
+    acc += easu_tap(vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h.rgb);
+    acc += easu_tap(vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g.rgb);
+    acc += easu_tap(vec2(1.0, 2.0) - pp, dir, len2, lob, clp, q.rgb);
+    acc += easu_tap(vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n.rgb);
+    let pix = min(max4, max(min4, acc.rgb / acc.a));
+
+    let plain = mix(mix(f.rgb, g.rgb, pp.x), mix(j.rgb, k.rgb, pp.x), pp.y);
+    let sharp = clamp(pix + EASU_SHARPEN * (pix - plain), min4, max4);
+    // The alpha carries the emissive mark through to HDR output (hdr.wgsl).
+    let alpha = mix(mix(f.a, g.a, pp.x), mix(j.a, k.a, pp.x), pp.y);
+    return vec4(sharp, alpha);
+}
+
 fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
